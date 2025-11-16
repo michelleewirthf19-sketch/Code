@@ -1,0 +1,238 @@
+# step1_vpa_groups_abs.py  —— 去除 lc_ilr & 全阶交互（1阶/2阶/3阶/4阶）
+import pandas as pd
+import numpy as np
+from pathlib import Path
+from statsmodels.formula.api import mixedlm
+from itertools import combinations
+import warnings
+warnings.filterwarnings("ignore")
+
+# ========= 配置 =========
+RAW_FILE    = r"C:\Users\Asus\Desktop\归因图及其原始数据\EXCEL\2000.xlsx"  # 原始数据：多个sheet=不同时间尺度
+TIMESCALES  = ["2000","2005", "2010", "2015"]                               # 与RAW_FILE中sheet名一致
+TARGETS     = ["HWD","HWF","HWM","HWN"]                                     # 四类指标
+
+GROUP_COL   = "id"       # mixedlm 分组
+TIME_COL    = "time"     # 若各组内有多时间点，将启用随机斜率
+USE_RANDOM_SLOPE = True
+
+# 仅保留你表中存在的小类（不再含 lc_ilr）
+FEATURE_RAW = ['NDVI', 'SPEI', '短波辐射', 'WS']
+
+# 大类分组（务必与数据列一致）
+FACTOR_GROUPS = {
+    "短波辐射": ["短波辐射"],
+    "干旱指数": ["SPEI"],
+    "植被指数": ["NDVI"],
+    "风速": ["WS"],
+}
+
+# ========= 工具 =========
+def safe_sheet(name, max_len=31):
+    for ch in ['[',']','*','?','/','\\',':']:
+        name = name.replace(ch,'_')
+    return name[:max_len]
+
+def standardize(df, cols):
+    X = df[cols].astype(float)
+    Xs = (X - X.mean(0)) / (X.std(0, ddof=1).replace(0,1.0))
+    out = df.copy()
+    out[cols] = Xs
+    return out
+
+def _need_quote(v: str) -> bool:
+    # 中文/非ASCII 或 含空格 → 用 Q("...") 包裹，避免 patsy 解析报错
+    return (' ' in v) or any(ord(ch) > 127 for ch in v)
+
+def build_formula(y, fe_list):
+    def wrap(n): return f'Q("{n}")' if _need_quote(n) else n
+    rhs = ' + '.join([wrap(v) for v in fe_list])
+    return f"{wrap(y)} ~ {rhs}"
+
+def fit_mixed(formula, data):
+    re_f = None
+    if USE_RANDOM_SLOPE and (TIME_COL in data.columns):
+        nuniq = data.groupby(GROUP_COL)[TIME_COL].nunique()
+        if (nuniq >= 2).any():
+            re_f = f"~{TIME_COL}"
+    model = mixedlm(formula, data, groups=data[GROUP_COL], re_formula=re_f)
+    res = model.fit(method='lbfgs', reml=True)
+    return res
+
+def marginal_r2(res, data, fe_cols):
+    fe = res.fe_params.drop(labels=[c for c in res.fe_params.index if c.lower().startswith("intercept")], errors='ignore')
+    fe_cols_in = [c for c in fe.index if c in data.columns]
+    yhat_fixed = np.dot(data[fe_cols_in], fe.loc[fe_cols_in].values) if fe_cols_in else np.zeros(len(data))
+    var_fixed = np.var(yhat_fixed, ddof=1)
+
+    var_rand = 0.0
+    try:
+        if hasattr(res, "random_effects") and len(res.random_effects) > 0:
+            Zu = []
+            for gid, re_vec in res.random_effects.items():
+                idx = (data[GROUP_COL] == gid)
+                n = idx.sum()
+                if len(re_vec) == 1:
+                    vals = np.full(n, float(re_vec.iloc[0]))
+                else:
+                    intercept = float(re_vec.iloc[0])
+                    slope = float(re_vec.iloc[1])
+                    tvals = data.loc[idx, TIME_COL].values.astype(float)
+                    vals = intercept + slope * tvals
+                Zu.append(vals)
+            if len(Zu) > 0:
+                Zu = np.concatenate(Zu)
+                var_rand = np.var(Zu, ddof=1)
+    except Exception:
+        var_rand = 0.0
+
+    var_resid = float(res.scale)
+    denom = var_fixed + var_rand + var_resid
+    return 0.0 if denom <= 0 else var_fixed/denom
+
+# ---- 通用：计算“去掉某些大类后的 ΔR²（并联贡献）” d_S = full - r2_wo_S ----
+def d_value_for_subset(full_r2m, y, df_std, all_feats, drop_feats):
+    drop_feats = [v for v in drop_feats if v in all_feats]
+    kept = [v for v in all_feats if v not in set(drop_feats)]
+    if len(kept) == 0:
+        r2m_red = 0.0   # 无自变量 → 固定效应方差为0 → R2_m 取0
+    else:
+        res_red = fit_mixed(build_formula(y, kept), df_std)
+        r2m_red = marginal_r2(res_red, df_std, kept)
+    dS = full_r2m - r2m_red
+    return max(dS, 0.0)
+
+def compute_all_d_values(full_r2m, y, df_std, all_feats, group_members):
+    """
+    为所有非空子集 S 计算 d_S = full - r2_wo_S
+    返回 dict: key = tuple(sorted group names), val = d_S
+    """
+    groups = sorted(group_members.keys())
+    d = {}
+    for r in range(1, len(groups)+1):
+        for subset in combinations(groups, r):
+            drop_feats = []
+            for g in subset:
+                drop_feats += group_members[g]
+            d[subset] = d_value_for_subset(full_r2m, y, df_std, all_feats, drop_feats)
+    return d
+
+def mobius_commonalities(d_dict):
+    """
+    Möbius 反演：C_S = sum_{T ⊆ S} (-1)^{|S|-|T|} d_T
+    返回 dict: key 同 d_dict，val = C_S
+    """
+    commons = {}
+    for subset in d_dict.keys():
+        k = len(subset)
+        total = 0.0
+        for t in range(1, k+1):
+            for T in combinations(subset, t):
+                total += ((-1)**(k - t)) * d_dict[T]
+        commons[subset] = total
+    return commons
+
+# ========= 主流程 =========
+all_books = []
+for ts in TIMESCALES:
+    df0 = pd.read_excel(RAW_FILE, sheet_name=ts).copy()
+
+    out_book = Path(RAW_FILE).with_name(f"Step1_VPA_大类与耦合_{ts}.xlsx")
+    all_books.append(str(out_book))
+
+    with pd.ExcelWriter(out_book, engine="openpyxl") as w:
+        for y in TARGETS:
+            # 仅使用当前 sheet 实际存在的特征列
+            feature_all = [c for c in FEATURE_RAW if c in df0.columns]
+
+            base_need = [GROUP_COL, y] + ([TIME_COL] if TIME_COL in df0.columns else [])
+            if any(c not in df0.columns for c in [GROUP_COL, y]):
+                print(f"[{ts}-{y}] 缺少 {GROUP_COL} 或 {y}，跳过。")
+                continue
+            if len(feature_all) < 1:
+                print(f"[{ts}-{y}] 无可用特征列，跳过。")
+                continue
+
+            need_cols = base_need + feature_all
+            df = df0[need_cols].dropna().copy()
+
+            # 标准化目标（稳定收敛，不改变相对贡献比例）
+            df[y] = df[y].astype(float)
+            y_mean, y_std = df[y].mean(), df[y].std(ddof=1) or 1.0
+            df[y] = (df[y] - y_mean) / y_std
+
+            # 标准化特征
+            df_std = standardize(df, feature_all)
+
+            # 全模型
+            res_full = fit_mixed(build_formula(y, feature_all), df_std)
+            r2m_full = marginal_r2(res_full, df_std, feature_all)
+
+            # ==== 构建“可用大类 → 成员特征”映射（仅保留存在的成员） ====
+            group_members = {g: [m for m in members if m in feature_all]
+                             for g, members in FACTOR_GROUPS.items()}
+            # 仅保留至少有1个成员的组
+            group_members = {g: ms for g, ms in group_members.items() if len(ms) > 0}
+            used_groups = sorted(group_members.keys())
+
+            # 若不足2个大类，仍输出单独贡献；交互自然为0
+            if len(used_groups) == 0:
+                print(f"[{ts}-{y}] 无可用大类，跳过。")
+                continue
+
+            # ==== 计算 d_S：删去子集 S 后下降的 R²（并联贡献） ====
+            d_dict = compute_all_d_values(r2m_full, y, df_std, feature_all, group_members)
+
+            # ==== Möbius 反演得到 commonality：唯一/二阶/三阶/四阶 ====
+            c_dict = mobius_commonalities(d_dict)
+
+            # —— 整理成 Series：唯一(1阶) 正；交互(>=2阶) 取绝对值 —— #
+            # 唯一
+            s_uni = {}
+            for g in used_groups:
+                val = c_dict[(g,)]
+                s_uni[g] = max(float(val), 0.0)
+
+            # 2阶
+            s_pair = {}
+            for a, b in combinations(used_groups, 2):
+                key = f"{a}+{b}"
+                s_pair[key] = abs(float(c_dict[(a, b)]))
+
+            # 3阶
+            s_tri = {}
+            if len(used_groups) >= 3:
+                for a, b, c in combinations(used_groups, 3):
+                    key = f"{a}+{b}+{c}"
+                    s_tri[key] = abs(float(c_dict[(a, b, c)]))
+
+            # 4阶
+            s_quad = {}
+            if len(used_groups) == 4:
+                a, b, c, d = used_groups
+                s_quad[f"{a}+{b}+{c}+{d}"] = abs(float(c_dict[(a, b, c, d)]))
+
+            # 合并与归一化（全为正）
+            s_uni = pd.Series(s_uni, dtype=float)
+            s_pair = pd.Series(s_pair, dtype=float) if len(s_pair) else pd.Series(dtype=float)
+            s_tri  = pd.Series(s_tri,  dtype=float) if len(s_tri)  else pd.Series(dtype=float)
+            s_quad = pd.Series(s_quad, dtype=float) if len(s_quad) else pd.Series(dtype=float)
+
+            all_contrib = pd.concat([s_uni, s_pair, s_tri, s_quad])
+            denom = float(np.sum(all_contrib.values)) or 1.0
+
+            df_gc = pd.DataFrame({
+                "raw": all_contrib,
+                "abs_%": all_contrib / denom * 100.0,
+                "signed_%": all_contrib / denom * 100.0  # 与 abs_% 一致，保留列名以兼容
+            }).sort_values("abs_%", ascending=False).round(4)
+
+            df_gc.to_excel(w, sheet_name=safe_sheet(f"{y}_大类与耦合_VPA"), index_label="Group/Coupling")
+
+    print(f"✅ Step1 输出：{out_book}")
+
+# 汇总提示文件（可用于Step2自动发现）
+pd.DataFrame({"timescale":TIMESCALES, "workbook":all_books}).to_csv(
+    Path(RAW_FILE).with_name("Step1_outputs_index.csv"), index=False, encoding="utf-8-sig"
+)
+print("✅ 索引：Step1_outputs_index.csv")
